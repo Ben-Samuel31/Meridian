@@ -313,7 +313,8 @@ func (a *App) auth() gin.HandlerFunc {
 }
 func (a *App) login(c *gin.Context) {
 	var in struct {
-		Email, Password string `json:"email"`
+		Email string `json:"email"`
+		Password string `json:"password"`
 	}
 	if c.ShouldBindJSON(&in) != nil {
 		c.JSON(400, gin.H{"error": "email and password are required"})
@@ -340,8 +341,10 @@ func parseID(c *gin.Context) (uuid.UUID, bool) {
 }
 func (a *App) createTarget(c *gin.Context) {
 	var in struct {
-		Name, BaseURL, Type string `json:"name"`
-	}
+    Name    string `json:"name"`
+    BaseURL string `json:"base_url"`
+    Type    string `json:"type"`
+}
 	if c.ShouldBindJSON(&in) != nil || in.Name == "" || (in.Type != "rest" && in.Type != "graphql") {
 		c.JSON(400, gin.H{"error": "name, base_url, and type (rest|graphql) are required"})
 		return
