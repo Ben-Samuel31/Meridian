@@ -1,0 +1,19 @@
+name: Meridian release gate
+on: [workflow_dispatch]
+jobs:
+  verify-api:
+    runs-on: ubuntu-latest
+    env:
+      MERIDIAN_URL: ${{ secrets.MERIDIAN_URL }}
+      MERIDIAN_TOKEN: ${{ secrets.MERIDIAN_TOKEN }}
+      MERIDIAN_TARGET_ID: ${{ secrets.MERIDIAN_TARGET_ID }}
+      MERIDIAN_WEBHOOK_SECRET: ${{ secrets.MERIDIAN_WEBHOOK_SECRET }}
+    steps:
+      - name: Send deployment event
+        run: |
+          body='{"target_id":"'"$MERIDIAN_TARGET_ID"'","version":"'"$GITHUB_SHA"'","deployed_by":"'"$GITHUB_ACTOR"'","source":"github","delivery_id":"'"$GITHUB_RUN_ID"'","deployed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
+          signature=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$MERIDIAN_WEBHOOK_SECRET" -hex | sed 's/^.* //')
+          curl --fail-with-body -X POST "$MERIDIAN_URL/webhooks/deployments" -H "Content-Type: application/json" -H "X-Meridian-Signature: sha256=$signature" -d "$body"
+      - name: Run release gate
+        run: |
+          curl --fail-with-body -X POST "$MERIDIAN_URL/targets/$MERIDIAN_TARGET_ID/gate" -H "Authorization: Bearer $MERIDIAN_TOKEN"

@@ -1,0 +1,11 @@
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS targets (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, base_url TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('rest','graphql')), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS schedule_interval_seconds INTEGER NOT NULL DEFAULT 0 CHECK (schedule_interval_seconds = 0 OR schedule_interval_seconds >= 30);
+CREATE TABLE IF NOT EXISTS probe_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, triggered_by TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ, overall_status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS probe_results (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), run_id UUID NOT NULL REFERENCES probe_runs(id) ON DELETE CASCADE, layer INTEGER NOT NULL CHECK (layer BETWEEN 1 AND 4), status TEXT NOT NULL CHECK (status IN ('pass','fail','skip')), latency_ms INTEGER NOT NULL DEFAULT 0, error_msg TEXT, checked_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS deployment_events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, version TEXT NOT NULL, deployed_by TEXT, deployed_at TIMESTAMPTZ NOT NULL, source TEXT NOT NULL, delivery_id TEXT UNIQUE NOT NULL);
+CREATE TABLE IF NOT EXISTS incidents (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id), run_id UUID NOT NULL REFERENCES probe_runs(id), failed_layer INTEGER NOT NULL, attributed_to TEXT NOT NULL, nearest_deploy_id UUID REFERENCES deployment_events(id), deploy_delta_mins INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS probe_runs_target_started_idx ON probe_runs(target_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS deployment_events_target_time_idx ON deployment_events(target_id, deployed_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_target_time_idx ON incidents(target_id, created_at DESC);
