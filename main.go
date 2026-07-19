@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/smtp"
 	"net/url"
 	"os"
 	"os/signal"
@@ -37,6 +38,7 @@ var migrations embed.FS
 type Config struct {
 	Port, DatabaseURL, MongoURL, MongoDatabase, JWTSecret, WebhookSecret string
 	AdminEmail, AdminPassword                                            string
+	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, SMTPFrom            string
 }
 
 type App struct {
@@ -118,7 +120,7 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 func config() Config {
-	return Config{Port: getenv("PORT", "8080"), DatabaseURL: getenv("DATABASE_URL", "postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable"), MongoURL: getenv("MONGO_URL", "mongodb://mongo:27017"), MongoDatabase: getenv("MONGO_DATABASE", "meridian"), JWTSecret: getenv("JWT_SECRET", "change-me-in-production"), WebhookSecret: getenv("WEBHOOK_SECRET", "change-me-webhook"), AdminEmail: getenv("ADMIN_EMAIL", "admin@meridian.local"), AdminPassword: getenv("ADMIN_PASSWORD", "meridian-demo")}
+	return Config{Port: getenv("PORT", "8080"), DatabaseURL: getenv("DATABASE_URL", "postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable"), MongoURL: getenv("MONGO_URL", "mongodb://mongo:27017"), MongoDatabase: getenv("MONGO_DATABASE", "meridian"), JWTSecret: getenv("JWT_SECRET", "change-me-in-production"), WebhookSecret: getenv("WEBHOOK_SECRET", "change-me-webhook"), AdminEmail: getenv("ADMIN_EMAIL", "admin@meridian.local"), AdminPassword: getenv("ADMIN_PASSWORD", "meridian-demo"), SMTPHost: getenv("SMTP_HOST", ""), SMTPPort: getenv("SMTP_PORT", "587"), SMTPUsername: getenv("SMTP_USERNAME", ""), SMTPPassword: getenv("SMTP_PASSWORD", ""), SMTPFrom: getenv("SMTP_FROM", "")}
 }
 
 type scheduledJob struct {
@@ -310,6 +312,11 @@ func (a *App) router() *gin.Engine {
 	api.GET("/targets/:id/runs", a.listRuns)
 	api.GET("/runs/:id", a.getRun)
 	api.GET("/incidents", a.listIncidents)
+	api.POST("/incidents/:id/acknowledge", a.acknowledgeIncident)
+	api.POST("/incidents/:id/resolve", a.resolveIncident)
+	api.GET("/alert-rules", a.listAlertRules)
+	api.POST("/alert-rules", a.createAlertRule)
+	api.DELETE("/alert-rules/:id", a.deleteAlertRule)
 	return r
 }
 func cors() gin.HandlerFunc {
@@ -621,6 +628,7 @@ func (a *App) execute(ctx context.Context, targetID uuid.UUID, trigger string) (
 			if r.Status == "fail" {
 				iid, verdict, e := a.attribute(ctx, targetID, runID, r.Layer)
 				if e == nil {
+					a.dispatchAlerts(ctx, iid)
 					out.IncidentID = &iid
 					out.Verdict = verdict
 				}
@@ -628,7 +636,7 @@ func (a *App) execute(ctx context.Context, targetID uuid.UUID, trigger string) (
 			}
 		}
 	} else {
-		_, _ = a.pg.Exec(ctx, `UPDATE incidents SET status='resolved',resolved_at=$1,last_seen_at=$1 WHERE target_id=$2 AND status='open'`, finished, targetID)
+		_, _ = a.pg.Exec(ctx, `UPDATE incidents SET status='resolved',resolved_at=$1,last_seen_at=$1 WHERE target_id=$2 AND status IN ('open','acknowledged')`, finished, targetID)
 	}
 	return out, nil
 }
@@ -997,7 +1005,7 @@ func (a *App) getRun(c *gin.Context) {
 	c.JSON(200, r)
 }
 func (a *App) listIncidents(c *gin.Context) {
-	rows, err := a.pg.Query(c, `SELECT i.id,i.target_id,i.run_id,i.failed_layer,i.attributed_to,i.nearest_deploy_id,i.deploy_delta_mins,i.created_at,i.status,i.first_seen_at,i.last_seen_at,i.resolved_at,i.failure_count,t.name FROM incidents i JOIN targets t ON t.id=i.target_id ORDER BY i.last_seen_at DESC LIMIT 100`)
+	rows, err := a.pg.Query(c, `SELECT i.id,i.target_id,i.run_id,i.failed_layer,i.attributed_to,i.nearest_deploy_id,i.deploy_delta_mins,i.created_at,i.status,i.first_seen_at,i.last_seen_at,i.resolved_at,i.failure_count,i.owner,i.acknowledged_at,i.acknowledgement_note,i.resolution_note,t.name FROM incidents i JOIN targets t ON t.id=i.target_id ORDER BY CASE WHEN i.status='resolved' THEN 1 ELSE 0 END,i.last_seen_at DESC LIMIT 100`)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -1010,14 +1018,90 @@ func (a *App) listIncidents(c *gin.Context) {
 		var class, name string
 		var dep *uuid.UUID
 		var created, firstSeen, lastSeen time.Time
-		var resolvedAt *time.Time
+		var resolvedAt, acknowledgedAt *time.Time
+		var owner, acknowledgementNote, resolutionNote *string
 		var status string
 		var failureCount int
-		_ = rows.Scan(&id, &tid, &rid, &layer, &class, &dep, &delta, &created, &status, &firstSeen, &lastSeen, &resolvedAt, &failureCount, &name)
-		out = append(out, gin.H{"id": id, "target_id": tid, "target_name": name, "run_id": rid, "failed_layer": layer, "attributed_to": class, "nearest_deploy_id": dep, "deploy_delta_mins": delta, "created_at": created, "status": status, "first_seen_at": firstSeen, "last_seen_at": lastSeen, "resolved_at": resolvedAt, "failure_count": failureCount})
+		_ = rows.Scan(&id, &tid, &rid, &layer, &class, &dep, &delta, &created, &status, &firstSeen, &lastSeen, &resolvedAt, &failureCount, &owner, &acknowledgedAt, &acknowledgementNote, &resolutionNote, &name)
+		out = append(out, gin.H{"id": id, "target_id": tid, "target_name": name, "run_id": rid, "failed_layer": layer, "attributed_to": class, "nearest_deploy_id": dep, "deploy_delta_mins": delta, "created_at": created, "status": status, "first_seen_at": firstSeen, "last_seen_at": lastSeen, "resolved_at": resolvedAt, "failure_count": failureCount, "owner": owner, "acknowledged_at": acknowledgedAt, "acknowledgement_note": acknowledgementNote, "resolution_note": resolutionNote})
 	}
 	c.JSON(200, out)
 }
+func (a *App) dispatchAlerts(ctx context.Context, incidentID uuid.UUID) {
+	var targetID uuid.UUID
+	var count int
+	if a.pg.QueryRow(ctx, `SELECT target_id,failure_count FROM incidents WHERE id=$1`, incidentID).Scan(&targetID, &count) != nil { return }
+	rows, err := a.pg.Query(ctx, `SELECT name,webhook_url,email_to FROM alert_rules WHERE target_id=$1 AND enabled=true AND min_failure_count=$2`, targetID, count)
+	if err != nil { return }
+	defer rows.Close()
+	for rows.Next() {
+		var name, webhook string
+		var emailTo *string
+		if rows.Scan(&name, &webhook, &emailTo) != nil { continue }
+		message := fmt.Sprintf("Meridian alert: %s has failed %d consecutive times. Open Meridian to investigate.", name, count)
+		body, _ := json.Marshal(gin.H{
+			"text": message, "incident_id": incidentID, "failure_count": count,
+			"@type": "MessageCard", "@context": "https://schema.org/extensions", "summary": message,
+			"themeColor": "E85D75", "title": "Meridian API alert",
+			"sections": []gin.H{{"facts": []gin.H{{"name": "Rule", "value": name}, {"name": "Consecutive failures", "value": strconv.Itoa(count)}, {"name": "Incident", "value": incidentID.String()}}}},
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook, strings.NewReader(string(body)))
+		if err != nil { continue }
+		req.Header.Set("Content-Type", "application/json")
+		_, _ = a.client.Do(req)
+		if emailTo != nil && strings.TrimSpace(*emailTo) != "" { a.sendAlertEmail(name, count, incidentID, *emailTo) }
+	}
+}
+func (a *App) sendAlertEmail(rule string, count int, incidentID uuid.UUID, recipients string) {
+	if a.cfg.SMTPHost == "" || a.cfg.SMTPFrom == "" { return }
+	to := strings.Split(recipients, ",")
+	for i := range to { to[i] = strings.TrimSpace(to[i]) }
+	message := fmt.Sprintf("To: %s\r\nFrom: %s\r\nSubject: Meridian API alert: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s has failed %d consecutive times. Incident: %s\r\n", strings.Join(to, ","), a.cfg.SMTPFrom, rule, rule, count, incidentID)
+	var auth smtp.Auth
+	if a.cfg.SMTPUsername != "" { auth = smtp.PlainAuth("", a.cfg.SMTPUsername, a.cfg.SMTPPassword, a.cfg.SMTPHost) }
+	_ = smtp.SendMail(net.JoinHostPort(a.cfg.SMTPHost, a.cfg.SMTPPort), auth, a.cfg.SMTPFrom, to, []byte(message))
+}
+func (a *App) acknowledgeIncident(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok { return }
+	var in struct { Owner string `json:"owner"`; Note string `json:"note"` }
+	if c.ShouldBindJSON(&in) != nil { c.JSON(400, gin.H{"error":"invalid acknowledgement"}); return }
+	if strings.TrimSpace(in.Owner) == "" { c.JSON(400, gin.H{"error":"owner is required"}); return }
+	tag, err := a.pg.Exec(c, `UPDATE incidents SET status='acknowledged',owner=$1,acknowledged_at=now(),acknowledgement_note=$2 WHERE id=$3 AND status IN ('open','acknowledged')`, strings.TrimSpace(in.Owner), strings.TrimSpace(in.Note), id)
+	if err != nil { c.JSON(500, gin.H{"error":err.Error()}); return }
+	if tag.RowsAffected() == 0 { c.JSON(409, gin.H{"error":"incident is already resolved or was not found"}); return }
+	c.JSON(200, gin.H{"status":"acknowledged","id":id})
+}
+func (a *App) resolveIncident(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok { return }
+	var in struct { Note string `json:"note"` }
+	if c.ShouldBindJSON(&in) != nil { c.JSON(400, gin.H{"error":"invalid resolution"}); return }
+	tag, err := a.pg.Exec(c, `UPDATE incidents SET status='resolved',resolved_at=now(),resolution_note=$1 WHERE id=$2 AND status IN ('open','acknowledged')`, strings.TrimSpace(in.Note), id)
+	if err != nil { c.JSON(500, gin.H{"error":err.Error()}); return }
+	if tag.RowsAffected() == 0 { c.JSON(409, gin.H{"error":"incident is already resolved or was not found"}); return }
+	c.JSON(200, gin.H{"status":"resolved","id":id})
+}
+func (a *App) listAlertRules(c *gin.Context) {
+	rows, err := a.pg.Query(c, `SELECT id,target_id,name,min_failure_count,webhook_url,email_to,enabled,created_at FROM alert_rules ORDER BY created_at DESC`)
+	if err != nil { c.JSON(500, gin.H{"error":err.Error()}); return }
+	defer rows.Close()
+	out := []gin.H{}
+	for rows.Next() { var id, targetID uuid.UUID; var name, webhook string; var emailTo *string; var threshold int; var enabled bool; var created time.Time; _ = rows.Scan(&id,&targetID,&name,&threshold,&webhook,&emailTo,&enabled,&created); out = append(out,gin.H{"id":id,"target_id":targetID,"name":name,"min_failure_count":threshold,"webhook_url":webhook,"email_to":emailTo,"enabled":enabled,"created_at":created}) }
+	c.JSON(200,out)
+}
+func (a *App) createAlertRule(c *gin.Context) {
+	var in struct { TargetID, Name, WebhookURL, EmailTo string `json:"-"`; MinFailureCount int `json:"min_failure_count"`; Enabled bool `json:"enabled"` }
+	var raw map[string]any
+	if c.ShouldBindJSON(&raw) != nil { c.JSON(400,gin.H{"error":"invalid alert rule"}); return }
+	in.TargetID,_ = raw["target_id"].(string); in.Name,_ = raw["name"].(string); in.WebhookURL,_ = raw["webhook_url"].(string); in.EmailTo,_ = raw["email_to"].(string); if n,ok:=raw["min_failure_count"].(float64);ok { in.MinFailureCount=int(n) }; if v,ok:=raw["enabled"].(bool);ok { in.Enabled=v } else { in.Enabled=true }
+	targetID, err := uuid.Parse(in.TargetID); webhook, parseErr := url.ParseRequestURI(in.WebhookURL)
+	if err != nil || parseErr != nil || webhook.Scheme!="https" || webhook.Host=="" || strings.TrimSpace(in.Name)=="" || in.MinFailureCount<1 { c.JSON(400,gin.H{"error":"name, target_id, HTTPS webhook_url, and a positive failure threshold are required"}); return }
+	var id uuid.UUID
+	err = a.pg.QueryRow(c,`INSERT INTO alert_rules(target_id,name,min_failure_count,webhook_url,email_to,enabled) VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,targetID,strings.TrimSpace(in.Name),in.MinFailureCount,in.WebhookURL,strings.TrimSpace(in.EmailTo),in.Enabled).Scan(&id)
+	if err != nil { c.JSON(500,gin.H{"error":err.Error()}); return }; c.JSON(201,gin.H{"id":id})
+}
+func (a *App) deleteAlertRule(c *gin.Context) { id,ok:=parseID(c); if !ok{return}; tag,err:=a.pg.Exec(c,`DELETE FROM alert_rules WHERE id=$1`,id); if err!=nil{c.JSON(500,gin.H{"error":err.Error()});return}; if tag.RowsAffected()==0{c.JSON(404,gin.H{"error":"alert rule not found"});return}; c.Status(204) }
 
 func (a *App) deploymentWebhook(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)

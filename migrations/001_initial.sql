@@ -12,7 +12,15 @@ ALTER TABLE incidents ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ NOT NUL
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS failure_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_status_check;
+ALTER TABLE incidents ADD CONSTRAINT incidents_status_check CHECK (status IN ('open','acknowledged','resolved'));
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS owner TEXT;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledgement_note TEXT;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution_note TEXT;
 CREATE INDEX IF NOT EXISTS probe_runs_target_started_idx ON probe_runs(target_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS deployment_events_target_time_idx ON deployment_events(target_id, deployed_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_target_time_idx ON incidents(target_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_open_target_layer_idx ON incidents(target_id, failed_layer) WHERE status='open';
+CREATE TABLE IF NOT EXISTS alert_rules (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, name TEXT NOT NULL, min_failure_count INTEGER NOT NULL DEFAULT 1 CHECK (min_failure_count > 0), webhook_url TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS email_to TEXT;

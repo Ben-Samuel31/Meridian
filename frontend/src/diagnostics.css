@@ -52,3 +52,21 @@
   gap: 8px;
   flex-wrap: wrap;
 }
+
+.incident-card { padding: 16px; border-radius: 9px; background: #111c32; border: 1px solid #2b3d61; }
+.incident-card.acknowledged { border-color: #4d719e; }
+.incident-card.resolved { opacity: .72; }
+.incident-card-heading { display: flex; align-items: center; gap: 10px; }
+.incident-card-heading > div { flex: 1; }
+.incident-card-heading strong,.incident-card-heading small { display: block; }
+.incident-card-heading small,.incident-workflow small { color: #aebbd2; }
+.incident-state { padding: 4px 8px; border-radius: 99px; background: #4c2430; color: #ffb3bf; text-transform: capitalize; font-size: .72rem; font-weight: 800; }
+.incident-state.acknowledged { background: #203a59; color: #a9d5ff; }
+.incident-state.resolved { background: #153d37; color: #93efdf; }
+.incident-card > p { margin: 12px 0; font-size: .88rem; }
+.incident-workflow { display: grid; grid-template-columns: minmax(180px,1fr) minmax(180px,1fr) auto; align-items: end; gap: 10px; padding-top: 12px; border-top: 1px solid #304260; }
+.incident-workflow label { display: grid; gap: 5px; font-size: .82rem; color: #c8d3e9; }
+.incident-workflow p { margin: 0; }
+.incident-done { display: grid; gap: 4px; padding-top: 10px; border-top: 1px solid #304260; color: #aebbd2; font-size: .86rem; }
+@media(max-width:700px){.incident-card-heading{align-items:flex-start;flex-wrap:wrap}.incident-card-heading .compact{margin-left:auto}.incident-workflow{grid-template-columns:1fr}.incident-workflow button{width:100%}}
+.modal-backdrop{position:fixed;inset:0;z-index:10;padding:24px;overflow:auto;background:rgba(4,8,18,.78);display:grid;place-items:start center}.alert-rules-page{width:min(860px,100%);margin:36px 0;background:#131d35;border:1px solid #3b527b;border-radius:14px;padding:24px}.alert-rules-page .section-heading p{margin:4px 0 0}.alert-rule-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:20px 0}.alert-rule-form label{display:grid;gap:6px;color:#c8d3e9;font-size:.84rem}.alert-rule-form button{grid-column:1/-1}.rule-list{display:grid;gap:9px}.rule-list article{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;background:#101b31;border-radius:8px}.rule-list strong,.rule-list small{display:block}.rule-list small{margin-top:4px;color:#aebbd2}@media(max-width:620px){.alert-rule-form{grid-template-columns:1fr}.modal-backdrop{padding:12px}.alert-rules-page{margin:0;padding:18px}}
