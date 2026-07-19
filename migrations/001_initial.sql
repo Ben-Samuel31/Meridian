@@ -4,8 +4,15 @@ CREATE TABLE IF NOT EXISTS targets (id UUID PRIMARY KEY DEFAULT gen_random_uuid(
 ALTER TABLE targets ADD COLUMN IF NOT EXISTS schedule_interval_seconds INTEGER NOT NULL DEFAULT 0 CHECK (schedule_interval_seconds = 0 OR schedule_interval_seconds >= 30);
 CREATE TABLE IF NOT EXISTS probe_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, triggered_by TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ, overall_status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS probe_results (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), run_id UUID NOT NULL REFERENCES probe_runs(id) ON DELETE CASCADE, layer INTEGER NOT NULL CHECK (layer BETWEEN 1 AND 4), status TEXT NOT NULL CHECK (status IN ('pass','fail','skip')), latency_ms INTEGER NOT NULL DEFAULT 0, error_msg TEXT, checked_at TIMESTAMPTZ NOT NULL);
+ALTER TABLE probe_results ADD COLUMN IF NOT EXISTS diagnostics JSONB;
 CREATE TABLE IF NOT EXISTS deployment_events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, version TEXT NOT NULL, deployed_by TEXT, deployed_at TIMESTAMPTZ NOT NULL, source TEXT NOT NULL, delivery_id TEXT UNIQUE NOT NULL);
 CREATE TABLE IF NOT EXISTS incidents (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id), run_id UUID NOT NULL REFERENCES probe_runs(id), failed_layer INTEGER NOT NULL, attributed_to TEXT NOT NULL, nearest_deploy_id UUID REFERENCES deployment_events(id), deploy_delta_mins INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved'));
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS failure_count INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS probe_runs_target_started_idx ON probe_runs(target_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS deployment_events_target_time_idx ON deployment_events(target_id, deployed_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_target_time_idx ON incidents(target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_open_target_layer_idx ON incidents(target_id, failed_layer) WHERE status='open';

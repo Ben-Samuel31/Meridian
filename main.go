@@ -82,15 +82,23 @@ type ContractConfig struct {
 	ExpectedShape  map[string]any `bson:"expected_shape" json:"expected_shape"`
 }
 type Assertion struct {
-	Field, Rule string `bson:"field" json:"field"`
-	Value       any    `bson:"value,omitempty" json:"value,omitempty"`
+	Field string `bson:"field" json:"field"`
+	Rule  string `bson:"rule" json:"rule"`
+	Value any    `bson:"value,omitempty" json:"value,omitempty"`
 }
 type LayerResult struct {
-	Layer        int       `json:"layer"`
-	Status       string    `json:"status"`
-	LatencyMS    int       `json:"latency_ms"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CheckedAt    time.Time `json:"checked_at"`
+	Layer        int               `json:"layer"`
+	Status       string            `json:"status"`
+	LatencyMS    int               `json:"latency_ms"`
+	ErrorMessage string            `json:"error_message,omitempty"`
+	Diagnostics  *ProbeDiagnostics `json:"diagnostics,omitempty"`
+	CheckedAt    time.Time         `json:"checked_at"`
+}
+type ProbeDiagnostics struct {
+	ExpectedStatus  int            `json:"expected_status,omitempty"`
+	ActualStatus    int            `json:"actual_status,omitempty"`
+	ExpectedShape   map[string]any `json:"expected_shape,omitempty"`
+	ResponsePreview any            `json:"response_preview,omitempty"`
 }
 type RunResponse struct {
 	ID            uuid.UUID     `json:"id"`
@@ -114,9 +122,10 @@ func config() Config {
 }
 
 type scheduledJob struct {
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	running bool
+	cancel       context.CancelFunc
+	activeCancel context.CancelFunc
+	mu           sync.Mutex
+	running      bool
 }
 type Scheduler struct {
 	app    *App
@@ -181,11 +190,27 @@ func (s *Scheduler) runOnce(parent context.Context, targetID uuid.UUID, job *sch
 		return
 	}
 	job.running = true
-	job.mu.Unlock()
-	defer func() { job.mu.Lock(); job.running = false; job.mu.Unlock() }()
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
+	job.activeCancel = cancel
+	job.mu.Unlock()
+	defer func() { cancel(); job.mu.Lock(); job.running = false; job.activeCancel = nil; job.mu.Unlock() }()
 	_, _ = s.app.execute(ctx, targetID, "scheduler")
+}
+func (s *Scheduler) Pause(targetID uuid.UUID) {
+	s.mu.Lock()
+	job := s.jobs[targetID]
+	if job != nil {
+		job.cancel()
+		delete(s.jobs, targetID)
+	}
+	s.mu.Unlock()
+	if job != nil {
+		job.mu.Lock()
+		if job.activeCancel != nil {
+			job.activeCancel()
+		}
+		job.mu.Unlock()
+	}
 }
 func (s *Scheduler) Stop() {
 	s.cancel()
@@ -276,8 +301,10 @@ func (a *App) router() *gin.Engine {
 	api.POST("/targets", a.createTarget)
 	api.GET("/targets", a.listTargets)
 	api.GET("/targets/:id", a.getTarget)
+	api.DELETE("/targets/:id", a.deleteTarget)
 	api.PUT("/targets/:id/config", a.putConfig)
 	api.PUT("/targets/:id/schedule", a.putSchedule)
+	api.POST("/targets/:id/pause", a.pauseTarget)
 	api.POST("/targets/:id/probe", a.runProbe)
 	api.POST("/targets/:id/gate", a.gate)
 	api.GET("/targets/:id/runs", a.listRuns)
@@ -289,7 +316,7 @@ func cors() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", getenv("CORS_ORIGIN", "http://localhost:5173"))
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if c.Request.Method == http.MethodOptions {
 			c.Status(204)
 			c.Abort()
@@ -389,6 +416,43 @@ func (a *App) getTarget(c *gin.Context) {
 	}
 	cfg, _ := a.getConfig(c, id)
 	c.JSON(200, gin.H{"target": t, "config": cfg})
+}
+func (a *App) deleteTarget(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	tx, err := a.pg.Begin(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback(c)
+	// Incidents retain foreign keys to targets and deployment events, so remove
+	// them before deleting the target (the remaining probe data cascades).
+	if _, err = tx.Exec(c, `DELETE FROM incidents WHERE target_id=$1`, id); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := tx.Exec(c, `DELETE FROM targets WHERE id=$1`, id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if result.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"error": "target not found"})
+		return
+	}
+	if err = tx.Commit(c); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	a.scheduler.Upsert(id, 0)
+	if _, err = a.configs.DeleteOne(c, bson.M{"target_id": id.String()}); err != nil {
+		c.JSON(500, gin.H{"error": "target deleted, but its probe configuration could not be removed: " + err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 func (a *App) target(ctx context.Context, id uuid.UUID) (Target, error) {
 	var t Target
@@ -532,7 +596,12 @@ func (a *App) execute(ctx context.Context, targetID uuid.UUID, trigger string) (
 		results = append(results, skipped(len(results)+1))
 	}
 	for _, r := range results {
-		_, err = a.pg.Exec(ctx, `INSERT INTO probe_results(run_id,layer,status,latency_ms,error_msg,checked_at) VALUES($1,$2,$3,$4,$5,$6)`, runID, r.Layer, r.Status, r.LatencyMS, r.ErrorMessage, r.CheckedAt)
+		var diagnostics any
+		if r.Diagnostics != nil {
+			b, _ := json.Marshal(r.Diagnostics)
+			diagnostics = string(b)
+		}
+		_, err = a.pg.Exec(ctx, `INSERT INTO probe_results(run_id,layer,status,latency_ms,error_msg,checked_at,diagnostics) VALUES($1,$2,$3,$4,$5,$6,$7)`, runID, r.Layer, r.Status, r.LatencyMS, r.ErrorMessage, r.CheckedAt, diagnostics)
 		if err != nil {
 			return RunResponse{}, err
 		}
@@ -558,6 +627,8 @@ func (a *App) execute(ctx context.Context, targetID uuid.UUID, trigger string) (
 				break
 			}
 		}
+	} else {
+		_, _ = a.pg.Exec(ctx, `UPDATE incidents SET status='resolved',resolved_at=$1,last_seen_at=$1 WHERE target_id=$2 AND status='open'`, finished, targetID)
 	}
 	return out, nil
 }
@@ -626,33 +697,37 @@ func (a *App) l2(ctx context.Context, t Target, cfg ProbeConfig) LayerResult {
 func (a *App) l3(ctx context.Context, t Target, cfg ProbeConfig) (LayerResult, map[string]any) {
 	start := time.Now()
 	r := LayerResult{Layer: 3, Status: "pass", CheckedAt: start.UTC()}
+	expected := cfg.L3.ExpectedStatus
+	if expected == 0 {
+		expected = 200
+	}
 	resp, body, err := a.request(ctx, t, cfg)
 	r.LatencyMS = int(time.Since(start).Milliseconds())
 	if err != nil {
 		r.Status = "fail"
 		r.ErrorMessage = "contract request failed: " + err.Error()
+		r.Diagnostics = contractDiagnostics(expected, 0, cfg.L3.ExpectedShape, nil)
 		return r, nil
 	}
 	defer resp.Body.Close()
-	expected := cfg.L3.ExpectedStatus
-	if expected == 0 {
-		expected = 200
-	}
 	if resp.StatusCode != expected {
 		r.Status = "fail"
 		r.ErrorMessage = fmt.Sprintf("expected status %d, got %d", expected, resp.StatusCode)
+		r.Diagnostics = contractDiagnostics(expected, resp.StatusCode, cfg.L3.ExpectedShape, body)
 		return r, nil
 	}
 	var data map[string]any
 	if err := json.Unmarshal(body, &data); err != nil {
 		r.Status = "fail"
 		r.ErrorMessage = "response is not valid JSON"
+		r.Diagnostics = contractDiagnostics(expected, resp.StatusCode, cfg.L3.ExpectedShape, body)
 		return r, nil
 	}
 	if t.Type == "graphql" {
 		if errs, ok := data["errors"]; ok && errs != nil {
 			r.Status = "fail"
 			r.ErrorMessage = "GraphQL response contains errors"
+			r.Diagnostics = contractDiagnostics(expected, resp.StatusCode, cfg.L3.ExpectedShape, body)
 			return r, data
 		}
 		if nested, ok := data["data"].(map[string]any); ok {
@@ -662,8 +737,60 @@ func (a *App) l3(ctx context.Context, t Target, cfg ProbeConfig) (LayerResult, m
 	if len(cfg.L3.ExpectedShape) > 0 && !matchesShape(data, cfg.L3.ExpectedShape) {
 		r.Status = "fail"
 		r.ErrorMessage = "response does not match expected shape"
+		r.Diagnostics = contractDiagnostics(expected, resp.StatusCode, cfg.L3.ExpectedShape, body)
 	}
 	return r, data
+}
+func (a *App) pauseTarget(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	var t Target
+	err := a.pg.QueryRow(c, `UPDATE targets SET schedule_interval_seconds=0 WHERE id=$1 RETURNING id,name,base_url,type,schedule_interval_seconds,created_at`, id).Scan(&t.ID, &t.Name, &t.BaseURL, &t.Type, &t.ScheduleIntervalSeconds, &t.CreatedAt)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "target not found"})
+		return
+	}
+	a.scheduler.Pause(id)
+	c.JSON(200, t)
+}
+func contractDiagnostics(expectedStatus, actualStatus int, expectedShape map[string]any, body []byte) *ProbeDiagnostics {
+	return &ProbeDiagnostics{ExpectedStatus: expectedStatus, ActualStatus: actualStatus, ExpectedShape: expectedShape, ResponsePreview: safeResponsePreview(body)}
+}
+func safeResponsePreview(body []byte) any {
+	const maxPreviewBytes = 12 * 1024
+	if len(body) > maxPreviewBytes {
+		body = body[:maxPreviewBytes]
+	}
+	var value any
+	if json.Unmarshal(body, &value) == nil {
+		return redactValue(value)
+	}
+	return "[non-JSON response preview omitted]"
+}
+func redactValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			lower := strings.ToLower(key)
+			if strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "authorization") || strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "cookie") || strings.Contains(lower, "credential") {
+				out[key] = "[redacted]"
+				continue
+			}
+			out[key] = redactValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = redactValue(item)
+		}
+		return out
+	default:
+		return value
+	}
 }
 func (a *App) request(ctx context.Context, t Target, cfg ProbeConfig) (*http.Response, []byte, error) {
 	endpoint := strings.TrimRight(t.BaseURL, "/")
@@ -814,7 +941,15 @@ func (a *App) attribute(ctx context.Context, targetID, runID uuid.UUID, layer in
 		verdict = fmt.Sprintf("%s failure correlated with deployment %s (%d minutes ago)", class, id.String(), delta)
 	}
 	var incidentID uuid.UUID
-	err = a.pg.QueryRow(ctx, `INSERT INTO incidents(target_id,run_id,failed_layer,attributed_to,nearest_deploy_id,deploy_delta_mins,created_at) VALUES($1,$2,$3,$4,$5,$6,now()) RETURNING id`, targetID, runID, layer, class, deployID, delta).Scan(&incidentID)
+	updated, err := a.pg.Exec(ctx, `UPDATE incidents SET run_id=$1,attributed_to=$2,nearest_deploy_id=$3,deploy_delta_mins=$4,last_seen_at=now(),failure_count=failure_count+1 WHERE target_id=$5 AND failed_layer=$6 AND status='open'`, runID, class, deployID, delta, targetID, layer)
+	if err != nil {
+		return uuid.Nil, verdict, err
+	}
+	if updated.RowsAffected() > 0 {
+		err = a.pg.QueryRow(ctx, `SELECT id FROM incidents WHERE target_id=$1 AND failed_layer=$2 AND status='open' ORDER BY last_seen_at DESC LIMIT 1`, targetID, layer).Scan(&incidentID)
+		return incidentID, verdict, err
+	}
+	err = a.pg.QueryRow(ctx, `INSERT INTO incidents(target_id,run_id,failed_layer,attributed_to,nearest_deploy_id,deploy_delta_mins,created_at,first_seen_at,last_seen_at,failure_count) VALUES($1,$2,$3,$4,$5,$6,now(),now(),now(),1) RETURNING id`, targetID, runID, layer, class, deployID, delta).Scan(&incidentID)
 	return incidentID, verdict, err
 }
 
@@ -848,17 +983,21 @@ func (a *App) getRun(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "run not found"})
 		return
 	}
-	rows, _ := a.pg.Query(c, `SELECT layer,status,latency_ms,COALESCE(error_msg,''),checked_at FROM probe_results WHERE run_id=$1 ORDER BY layer`, id)
+	rows, _ := a.pg.Query(c, `SELECT layer,status,latency_ms,COALESCE(error_msg,''),checked_at,COALESCE(diagnostics,'{}'::jsonb) FROM probe_results WHERE run_id=$1 ORDER BY layer`, id)
 	defer rows.Close()
 	for rows.Next() {
 		var x LayerResult
-		_ = rows.Scan(&x.Layer, &x.Status, &x.LatencyMS, &x.ErrorMessage, &x.CheckedAt)
+		var diagnostics []byte
+		_ = rows.Scan(&x.Layer, &x.Status, &x.LatencyMS, &x.ErrorMessage, &x.CheckedAt, &diagnostics)
+		if len(diagnostics) > 0 && string(diagnostics) != "null" {
+			_ = json.Unmarshal(diagnostics, &x.Diagnostics)
+		}
 		r.Results = append(r.Results, x)
 	}
 	c.JSON(200, r)
 }
 func (a *App) listIncidents(c *gin.Context) {
-	rows, err := a.pg.Query(c, `SELECT i.id,i.target_id,i.run_id,i.failed_layer,i.attributed_to,i.nearest_deploy_id,i.deploy_delta_mins,i.created_at,t.name FROM incidents i JOIN targets t ON t.id=i.target_id ORDER BY i.created_at DESC LIMIT 100`)
+	rows, err := a.pg.Query(c, `SELECT i.id,i.target_id,i.run_id,i.failed_layer,i.attributed_to,i.nearest_deploy_id,i.deploy_delta_mins,i.created_at,i.status,i.first_seen_at,i.last_seen_at,i.resolved_at,i.failure_count,t.name FROM incidents i JOIN targets t ON t.id=i.target_id ORDER BY i.last_seen_at DESC LIMIT 100`)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -870,9 +1009,12 @@ func (a *App) listIncidents(c *gin.Context) {
 		var layer, delta int
 		var class, name string
 		var dep *uuid.UUID
-		var created time.Time
-		_ = rows.Scan(&id, &tid, &rid, &layer, &class, &dep, &delta, &created, &name)
-		out = append(out, gin.H{"id": id, "target_id": tid, "target_name": name, "run_id": rid, "failed_layer": layer, "attributed_to": class, "nearest_deploy_id": dep, "deploy_delta_mins": delta, "created_at": created})
+		var created, firstSeen, lastSeen time.Time
+		var resolvedAt *time.Time
+		var status string
+		var failureCount int
+		_ = rows.Scan(&id, &tid, &rid, &layer, &class, &dep, &delta, &created, &status, &firstSeen, &lastSeen, &resolvedAt, &failureCount, &name)
+		out = append(out, gin.H{"id": id, "target_id": tid, "target_name": name, "run_id": rid, "failed_layer": layer, "attributed_to": class, "nearest_deploy_id": dep, "deploy_delta_mins": delta, "created_at": created, "status": status, "first_seen_at": firstSeen, "last_seen_at": lastSeen, "resolved_at": resolvedAt, "failure_count": failureCount})
 	}
 	c.JSON(200, out)
 }
