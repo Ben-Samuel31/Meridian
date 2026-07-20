@@ -315,6 +315,11 @@ func (a *App) router() *gin.Engine {
 	api.POST("/incidents/:id/acknowledge", a.acknowledgeIncident)
 	api.POST("/incidents/:id/resolve", a.resolveIncident)
 	api.GET("/alert-rules", a.listAlertRules)
+	api.GET("/analytics", a.analytics)
+	api.GET("/analytics/trends", a.analyticsTrends)
+	api.GET("/analytics/layers", a.analyticsLayers)
+	api.GET("/targets/:id/slo", a.getSLO)
+	api.PUT("/targets/:id/slo", a.putSLO)
 	api.POST("/alert-rules", a.createAlertRule)
 	api.DELETE("/alert-rules/:id", a.deleteAlertRule)
 	return r
@@ -1089,6 +1094,68 @@ func (a *App) listAlertRules(c *gin.Context) {
 	out := []gin.H{}
 	for rows.Next() { var id, targetID uuid.UUID; var name, webhook string; var emailTo *string; var threshold int; var enabled bool; var created time.Time; _ = rows.Scan(&id,&targetID,&name,&threshold,&webhook,&emailTo,&enabled,&created); out = append(out,gin.H{"id":id,"target_id":targetID,"name":name,"min_failure_count":threshold,"webhook_url":webhook,"email_to":emailTo,"enabled":enabled,"created_at":created}) }
 	c.JSON(200,out)
+}
+func (a *App) analytics(c *gin.Context) {
+	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
+	if hours != 24 && hours != 168 && hours != 720 { c.JSON(400, gin.H{"error":"hours must be 24, 168, or 720"}); return }
+	rows, err := a.pg.Query(c, `SELECT t.id,t.name,COUNT(r.id),COUNT(r.id) FILTER (WHERE r.overall_status='pass'),COUNT(r.id) FILTER (WHERE r.overall_status='fail'),COALESCE(AVG(x.latency),0) FROM targets t LEFT JOIN probe_runs r ON r.target_id=t.id AND r.started_at >= now() - ($1 * interval '1 hour') LEFT JOIN LATERAL (SELECT SUM(latency_ms) AS latency FROM probe_results WHERE run_id=r.id) x ON true GROUP BY t.id,t.name ORDER BY t.name`, hours)
+	if err != nil { c.JSON(500,gin.H{"error":err.Error()});return }
+	defer rows.Close(); out:=[]gin.H{}
+	for rows.Next(){var id uuid.UUID;var name string;var total,passed,failed int;var latency float64;_ = rows.Scan(&id,&name,&total,&passed,&failed,&latency);uptime:=float64(0);if total>0{uptime=float64(passed)*100/float64(total)};out=append(out,gin.H{"target_id":id,"target_name":name,"runs":total,"passed":passed,"failed":failed,"uptime_percent":uptime,"average_latency_ms":int(latency)})};c.JSON(200,gin.H{"hours":hours,"targets":out})
+}
+func (a *App) analyticsTrends(c *gin.Context) {
+	hours,_:=strconv.Atoi(c.DefaultQuery("hours","24"));if hours!=24&&hours!=168&&hours!=720{c.JSON(400,gin.H{"error":"hours must be 24, 168, or 720"});return};bucket:="hour";if hours>=168{bucket="day"};targetID:=c.Query("target_id");if targetID!=""{if _,err:=uuid.Parse(targetID);err!=nil{c.JSON(400,gin.H{"error":"target_id must be a UUID"});return}}
+	rows,err:=a.pg.Query(c,`SELECT date_trunc($1,started_at),COUNT(*),COUNT(*) FILTER (WHERE overall_status='pass'),COALESCE(AVG((SELECT SUM(latency_ms) FROM probe_results WHERE run_id=probe_runs.id)),0),COUNT(*) FILTER (WHERE overall_status='fail') FROM probe_runs WHERE started_at>=now()-($2*interval '1 hour') AND (NULLIF($3,'')::uuid IS NULL OR target_id=NULLIF($3,'')::uuid) GROUP BY 1 ORDER BY 1`,bucket,hours,targetID);if err!=nil{c.JSON(500,gin.H{"error":err.Error()});return};defer rows.Close();out:=[]gin.H{};for rows.Next(){var at time.Time;var total,pass,fail int;var latency float64;_ = rows.Scan(&at,&total,&pass,&latency,&fail);out=append(out,gin.H{"at":at,"uptime_percent":float64(pass)*100/float64(total),"average_latency_ms":int(latency),"failed":fail})};c.JSON(200,gin.H{"hours":hours,"target_id":targetID,"points":out})
+}
+func (a *App) analyticsLayers(c *gin.Context) {
+	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
+	if hours != 24 && hours != 168 && hours != 720 {
+		c.JSON(400, gin.H{"error": "hours must be 24, 168, or 720"})
+		return
+	}
+	targetID := c.Query("target_id")
+	if targetID != "" {
+		if _, err := uuid.Parse(targetID); err != nil {
+			c.JSON(400, gin.H{"error": "target_id must be a UUID"})
+			return
+		}
+	}
+	rows, err := a.pg.Query(c, `SELECT p.layer,COUNT(*) FROM probe_results p JOIN probe_runs r ON r.id=p.run_id WHERE p.status='fail' AND r.started_at>=now()-($1*interval '1 hour') AND (NULLIF($2,'')::uuid IS NULL OR r.target_id=NULLIF($2,'')::uuid) GROUP BY p.layer ORDER BY p.layer`, hours, targetID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	counts := map[int]int{1: 0, 2: 0, 3: 0, 4: 0}
+	for rows.Next() {
+		var layer, count int
+		_ = rows.Scan(&layer, &count)
+		counts[layer] = count
+	}
+	names := map[int]string{1: "L1 Connectivity", 2: "L2 Authentication", 3: "L3 Contract", 4: "L4 Data"}
+	out := []gin.H{}
+	for layer := 1; layer <= 4; layer++ {
+		out = append(out, gin.H{"layer": layer, "name": names[layer], "failures": counts[layer]})
+	}
+	c.JSON(200, gin.H{"hours": hours, "target_id": targetID, "layers": out})
+}
+func (a *App) getSLO(c *gin.Context) {
+	id, ok := parseID(c); if !ok { return }
+	var target float64; var window int
+	err := a.pg.QueryRow(c, `SELECT target_uptime_percent,window_hours FROM slo_targets WHERE target_id=$1`, id).Scan(&target,&window)
+	if err != nil { c.JSON(404,gin.H{"error":"SLO not configured"}); return }
+	var total, passed int
+	_ = a.pg.QueryRow(c, `SELECT COUNT(*),COUNT(*) FILTER (WHERE overall_status='pass') FROM probe_runs WHERE target_id=$1 AND started_at >= now() - ($2 * interval '1 hour')`, id, window).Scan(&total,&passed)
+	failed:=total-passed; actual:=float64(0); if total>0 { actual=float64(passed)*100/float64(total) }; allowed:=float64(total)*(100-target)/100; remaining:=allowed-float64(failed); state:="on_track"; if total==0 { state="no_data" } else if remaining<0 { state="breached" } else if allowed>0 && remaining/allowed<0.2 { state="at_risk" }
+	c.JSON(200, gin.H{"target_id":id,"target_uptime_percent":target,"window_hours":window,"actual_uptime_percent":actual,"runs":total,"failed_runs":failed,"error_budget_allowed":allowed,"error_budget_remaining":remaining,"state":state})
+}
+func (a *App) putSLO(c *gin.Context) {
+	id, ok := parseID(c); if !ok { return }
+	var in struct { TargetUptimePercent float64 `json:"target_uptime_percent"`; WindowHours int `json:"window_hours"` }
+	if c.ShouldBindJSON(&in) != nil || in.TargetUptimePercent <= 0 || in.TargetUptimePercent >= 100 || (in.WindowHours != 24 && in.WindowHours != 168 && in.WindowHours != 720) { c.JSON(400,gin.H{"error":"target_uptime_percent must be between 0 and 100; window_hours must be 24, 168, or 720"}); return }
+	if _,err:=a.target(c,id);err!=nil { c.JSON(404,gin.H{"error":"target not found"});return }
+	_,err:=a.pg.Exec(c,`INSERT INTO slo_targets(target_id,target_uptime_percent,window_hours,updated_at) VALUES($1,$2,$3,now()) ON CONFLICT(target_id) DO UPDATE SET target_uptime_percent=EXCLUDED.target_uptime_percent,window_hours=EXCLUDED.window_hours,updated_at=now()`,id,in.TargetUptimePercent,in.WindowHours)
+	if err!=nil { c.JSON(500,gin.H{"error":err.Error()});return };c.JSON(200,gin.H{"target_id":id,"target_uptime_percent":in.TargetUptimePercent,"window_hours":in.WindowHours})
 }
 func (a *App) createAlertRule(c *gin.Context) {
 	var in struct { TargetID, Name, WebhookURL, EmailTo string `json:"-"`; MinFailureCount int `json:"min_failure_count"`; Enabled bool `json:"enabled"` }

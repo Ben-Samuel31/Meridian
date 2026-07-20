@@ -24,3 +24,4 @@ CREATE INDEX IF NOT EXISTS incidents_target_time_idx ON incidents(target_id, cre
 CREATE INDEX IF NOT EXISTS incidents_open_target_layer_idx ON incidents(target_id, failed_layer) WHERE status='open';
 CREATE TABLE IF NOT EXISTS alert_rules (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE, name TEXT NOT NULL, min_failure_count INTEGER NOT NULL DEFAULT 1 CHECK (min_failure_count > 0), webhook_url TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS email_to TEXT;
+CREATE TABLE IF NOT EXISTS slo_targets (target_id UUID PRIMARY KEY REFERENCES targets(id) ON DELETE CASCADE, target_uptime_percent NUMERIC(5,3) NOT NULL CHECK (target_uptime_percent > 0 AND target_uptime_percent < 100), window_hours INTEGER NOT NULL DEFAULT 720 CHECK (window_hours IN (24,168,720)), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
