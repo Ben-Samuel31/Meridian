@@ -24,8 +24,21 @@ services:
       MONGO_URL: mongodb://mongo:27017
       JWT_SECRET: ${JWT_SECRET:-local-development-secret}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-webhook-secret}
+      # Set a long, unique value in .env for every non-development deployment.
+      ALERT_WEBHOOK_ENCRYPTION_KEY: ${ALERT_WEBHOOK_ENCRYPTION_KEY:-local-development-alert-encryption-key}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@meridian.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-meridian-demo}
+      DASHBOARD_URL: ${DASHBOARD_URL:-http://localhost:5173}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-local-development-mfa-encryption-key}
+      OIDC_AUTH_URL: ${OIDC_AUTH_URL:-}
+      OIDC_TOKEN_URL: ${OIDC_TOKEN_URL:-}
+      OIDC_USERINFO_URL: ${OIDC_USERINFO_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL:-}
+      OIDC_AUTO_PROVISION: ${OIDC_AUTO_PROVISION:-false}
+      OIDC_DEFAULT_ROLE: ${OIDC_DEFAULT_ROLE:-viewer}
+      RETENTION_DAYS: ${RETENTION_DAYS:-90}
       CORS_ORIGIN: http://localhost:5173
     ports: ["8080:8080"]
   dashboard:
