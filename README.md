@@ -8,6 +8,41 @@ It is designed for teams that want a clear answer to three questions:
 2. If it is not, what exactly failed?
 3. Did a recent deployment probably cause it?
 
+## OpenAI Build Week submission
+
+**Category:** Developer Tools
+
+### The problem
+
+Teams frequently discover an API failure from a vague uptime alert, a failed deployment, or a customer report. The hard part is not merely knowing that a request failed; it is establishing whether the network, authentication, API contract, or returned business data is responsible, then getting the finding to the right person with enough context to act.
+
+### The solution
+
+Meridian turns an API check into an operational explanation. A target is evaluated through four progressive layers, correlated with recent deployments, represented as an incident, delivered through reliable notification channels, and measured against an SLO. The dashboard gives a team one shared place to investigate both the monitored API and the health of Meridian itself.
+
+### Why it is different
+
+Meridian is intentionally more than a request client and more specific than a generic uptime checker:
+
+- **Layered diagnosis:** a failed run says whether the issue is reachability, credentials, contract, or data.
+- **Deployment attribution:** failures are automatically compared with deployments from the preceding 30 minutes.
+- **Actionable reliability:** incidents, acknowledgements, SLOs, error budgets, release gates, and alert delivery history connect detection to response.
+- **Self-hosted and private-network ready:** private agents run checks inside a network without exposing internal APIs.
+- **Secure by default:** SSRF protection, encrypted webhook storage, scoped automation tokens, sessions, MFA, and optional OIDC/SSO are built in.
+
+### How Codex and GPT-5.6 were used
+
+Meridian was built iteratively with Codex in ChatGPT using GPT-5.6 as a collaborative engineering partner. Codex accelerated the project by helping design and implement the Go API and React dashboard together, trace build and type errors, add migrations and security controls, create tests and CI automation, refine the UX through repeated feedback, and produce the operational documentation and demo flow. The resulting repository is a working, runnable product rather than a static prototype.
+
+### Three-minute judge demo
+
+1. Create or select a target, run a successful probe, and open its L1–L4 results.
+2. Introduce a contract mismatch, run again, and open the resulting incident to show layer attribution and deployment context.
+3. Open **Analytics** and the target SLO to show reliability trends and error budget.
+4. Open **Administration → Alert rules**, use **Test send**, then show retry-aware **History**.
+5. Open **Operations** to show Meridian’s own health and retention controls.
+6. Open **Security** to show MFA; mention optional SSO and private-network agents.
+
 ## What Meridian includes
 
 - REST and GraphQL targets
