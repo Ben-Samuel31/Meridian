@@ -29,7 +29,7 @@ type AdminPanel = 'alerts'|'agents'|'tokens'|'users'|'audit'
 async function request(path:string, token:string, options:RequestInit={}) {
   const response = await fetch(API + path, { ...options, headers: {'Content-Type':'application/json', ...(token ? {Authorization:`Bearer ${token}`} : {}), ...(options.headers || {})} })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`)
+  if (!response.ok) throw Object.assign(new Error(data.error || `Request failed (${response.status})`), { status: response.status, code: data.code as string | undefined })
   return data
 }
 
@@ -67,6 +67,8 @@ export default function App() {
   const verifyMFA = async (e:FormEvent) => { e.preventDefault(); setError(''); setBusy('mfa'); try { const data=await request('/auth/mfa/verify','',{method:'POST',body:JSON.stringify({challenge:mfaChallenge,code:mfaCode})}); localStorage.setItem('meridian_token',data.token); setUser(data.user); setToken(data.token); setMFAChallenge(''); setMFACode('') } catch(e) { setError((e as Error).message) } finally { setBusy('') } }
   const signOut = async () => { try { await request('/auth/logout',token,{method:'POST'}) } catch { /* Clear the local credential even when the session already expired. */ } finally { localStorage.removeItem('meridian_token'); setUser(null); setToken('') } }
   const canAdmin = user?.role==='admin', canOperate = canAdmin || user?.role==='operator'
+  const [toast,setToast] = useState<{tone:'warning';title:string;message:string}|null>(null)
+  useEffect(() => { if (!toast) return; const id = window.setTimeout(() => setToast(null), 6000); return () => window.clearTimeout(id) }, [toast])
   const fetchJSON = useCallback((path:string) => request(path,token), [token])
   const mergeStatuses = useCallback((statuses:Record<string,string>) => setTargetStatuses(previous => ({...previous,...statuses})), [])
   const resetAdminPanels = () => { setShowAlertRules(false); setShowAgents(false); setShowTokens(false); setShowUsers(false); setShowAudit(false) }
@@ -96,13 +98,16 @@ export default function App() {
     } catch(e) { setError((e as Error).message) } finally { setBusy('') }
   }
   const create = async (e:FormEvent) => {
-    e.preventDefault(); setError(''); setBusy('create')
+    e.preventDefault(); setError('')
+    const trimmedName = name.trim(), existing = targets.find(t => t.name.trim().toLowerCase() === trimmedName.toLowerCase())
+    if (existing) { setToast({tone:'warning',title:'Duplicate target name',message:`A target named "${existing.name}" already exists. Choose a different name.`}); return }
+    setBusy('create')
     try {
-      const target=await request('/targets',token,{method:'POST',body:JSON.stringify({name,base_url:baseUrl,type})})
+      const target=await request('/targets',token,{method:'POST',body:JSON.stringify({name:trimmedName,base_url:baseUrl,type})})
       const config=defaultConfig(type)
       await request(`/targets/${target.id}/config`,token,{method:'PUT',body:JSON.stringify(config)})
       setTargets(previous => [target,...previous]); setSelected(target); setRuns([]); setActiveRun(null); setConfigText(JSON.stringify(config,null,2)); setInterval('0'); setNotice(`${target.name} was added. Configure it, then run a probe.`)
-    } catch(e) { setError((e as Error).message) } finally { setBusy('') }
+    } catch(e) { const err = e as Error & {status?:number}; if (err.status === 409) setToast({tone:'warning',title:'Duplicate target name',message:err.message}); else setError(err.message) } finally { setBusy('') }
   }
   const showRun = async (run:Run) => {
     setError(''); setActiveRun(run); setBusy(`run-${run.id}`)
@@ -164,6 +169,7 @@ export default function App() {
       {showAgents&&<AgentManagement agents={agents} targets={targets} busy={busy} onClose={closeAdminPanel} onCreate={async name=>{setBusy('agent');try{const created=await request('/agents',token,{method:'POST',body:JSON.stringify({name})});setAgents(await request('/agents',token));return created.agent_key}catch(e){setError(`Agent: ${(e as Error).message}`);return ''}finally{setBusy('')}}} onAssign={async(targetID,agentID)=>{setBusy('agent-assignment');try{await request(`/targets/${targetID}/agent`,token,{method:'PUT',body:JSON.stringify({agent_id:agentID})});setAgents(await request('/agents',token));setNotice(agentID?'Target assigned to agent.':'Target returned to Meridian.')}catch(e){setError(`Agent assignment: ${(e as Error).message}`)}finally{setBusy('')}}} onRevoke={async id=>{if(!window.confirm('Revoke this agent? It will immediately lose access.'))return;setBusy(`agent-${id}`);try{await request(`/agents/${id}`,token,{method:'DELETE'});setAgents(await request('/agents',token));setNotice('Agent revoked.')}catch(e){setError(`Agent: ${(e as Error).message}`)}finally{setBusy('')}}}/>} 
     </div></section>}
     {error&&<div className="alert error" role="alert"><strong>Action needed</strong><span>{error}</span><button onClick={()=>setError('')} aria-label="Dismiss error">Dismiss</button></div>}
+    {toast&&<div className={`toast ${toast.tone}`} role="alert" aria-live="assertive"><span className="toast-icon" aria-hidden="true">!</span><div><strong>{toast.title}</strong><span>{toast.message}</span></div><button className="toast-close" onClick={()=>setToast(null)} aria-label="Dismiss warning">×</button></div>}
     {notice&&<div className="alert success" role="status"><span>{notice}</span><button onClick={()=>setNotice('')} aria-label="Dismiss notice">Dismiss</button></div>}
     {showMFA&&<MFASettings enabled={mfaEnabled} onClose={()=>setShowMFA(false)} onSetup={()=>request('/auth/mfa/setup',token,{method:'POST'})} onConfirm={async code=>{const result=await request('/auth/mfa/confirm',token,{method:'POST',body:JSON.stringify({code})});setMFAEnabled(true);return result}} onDisable={async code=>{await request('/auth/mfa/disable',token,{method:'POST',body:JSON.stringify({code})});setMFAEnabled(false)}}/>}
     {showWorkflows&&<WorkflowManager targets={targets} workflows={workflows} onClose={()=>setShowWorkflows(false)} onCreate={async body=>{await request('/workflows',token,{method:'POST',body:JSON.stringify(body)});setWorkflows(await request('/workflows',token))}} onRun={async id=>{const run=await request(`/workflows/${id}/run`,token,{method:'POST'});setNotice(`Workflow ${run.status}.`);return run}} onDelete={async id=>{if(!window.confirm('Delete this workflow?'))return;await request(`/workflows/${id}`,token,{method:'DELETE'});setWorkflows(await request('/workflows',token));setNotice('Workflow deleted.')}}/>}

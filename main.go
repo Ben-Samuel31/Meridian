@@ -801,7 +801,9 @@ func (a *App) createTarget(c *gin.Context) {
     BaseURL string `json:"base_url"`
     Type    string `json:"type"`
 }
-	if c.ShouldBindJSON(&in) != nil || in.Name == "" || (in.Type != "rest" && in.Type != "graphql") {
+	_ = c.ShouldBindJSON(&in)
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" || (in.Type != "rest" && in.Type != "graphql") {
 		c.JSON(400, gin.H{"error": "name, base_url, and type (rest|graphql) are required"})
 		return
 	}
@@ -814,8 +816,33 @@ func (a *App) createTarget(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "base_url is blocked by outbound security policy: " + err.Error()})
 		return
 	}
+	// Target names are unique, ignoring case and surrounding whitespace. The
+	// transaction-scoped advisory lock serialises concurrent creates of the same
+	// name so two requests cannot both pass the existence check.
+	tx, err := a.pg.Begin(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback(c)
+	if _, err := tx.Exec(c, `SELECT pg_advisory_xact_lock(hashtext('target-name:' || lower($1)))`, in.Name); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	var exists bool
+	if err := tx.QueryRow(c, `SELECT EXISTS (SELECT 1 FROM targets WHERE lower(btrim(name)) = lower($1))`, in.Name).Scan(&exists); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if exists {
+		c.JSON(409, gin.H{"error": fmt.Sprintf("A target named %q already exists. Choose a different name.", in.Name), "code": "duplicate_target_name"})
+		return
+	}
 	var t Target
-	err = a.pg.QueryRow(c, `INSERT INTO targets(name,base_url,type) VALUES($1,$2,$3) RETURNING id,name,base_url,type,schedule_interval_seconds,created_at`, in.Name, in.BaseURL, in.Type).Scan(&t.ID, &t.Name, &t.BaseURL, &t.Type, &t.ScheduleIntervalSeconds, &t.CreatedAt)
+	err = tx.QueryRow(c, `INSERT INTO targets(name,base_url,type) VALUES($1,$2,$3) RETURNING id,name,base_url,type,schedule_interval_seconds,created_at`, in.Name, in.BaseURL, in.Type).Scan(&t.ID, &t.Name, &t.BaseURL, &t.Type, &t.ScheduleIntervalSeconds, &t.CreatedAt)
+	if err == nil {
+		err = tx.Commit(c)
+	}
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
