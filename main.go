@@ -456,6 +456,7 @@ func (a *App) router() *gin.Engine {
 	api.GET("/alert-rules", a.listAlertRules)
 	api.GET("/alert-rules/:id/deliveries", a.requireRoles("admin"), a.listAlertDeliveries)
 	api.POST("/alert-rules/:id/test", a.requireRoles("admin"), a.audit("alert_rule.tested", "alert_rule", "Sent an alert test"), a.testAlertRule)
+	api.GET("/overview", a.overview)
 	api.GET("/analytics", a.analytics)
 	api.GET("/analytics/trends", a.analyticsTrends)
 	api.GET("/analytics/layers", a.analyticsLayers)
@@ -1616,13 +1617,160 @@ func (a *App) listAlertRules(c *gin.Context) {
 }
 func (a *App) listAlertDeliveries(c *gin.Context) { ruleID,ok:=parseID(c);if !ok{return};rows,err:=a.pg.Query(c,`SELECT id,incident_id,channel,status,attempt,response_status,error_message,created_at FROM alert_deliveries WHERE rule_id=$1 ORDER BY created_at DESC LIMIT 100`,ruleID);if err!=nil{c.JSON(500,gin.H{"error":"could not load alert deliveries"});return};defer rows.Close();out:=[]gin.H{};for rows.Next(){var id uuid.UUID;var incidentID *uuid.UUID;var channel,status string;var attempt int;var responseStatus *int;var message *string;var created time.Time;if rows.Scan(&id,&incidentID,&channel,&status,&attempt,&responseStatus,&message,&created)==nil{out=append(out,gin.H{"id":id,"incident_id":incidentID,"channel":channel,"status":status,"attempt":attempt,"response_status":responseStatus,"error_message":message,"created_at":created})}};c.JSON(200,out) }
 func (a *App) testAlertRule(c *gin.Context) { ruleID,ok:=parseID(c);if !ok{return};var name,webhook string;var emailTo *string;if a.pg.QueryRow(c,`SELECT name,webhook_url,email_to FROM alert_rules WHERE id=$1`,ruleID).Scan(&name,&webhook,&emailTo)!=nil{c.JSON(404,gin.H{"error":"alert rule not found"});return};plain,err:=a.decryptAlertWebhook(webhook);if err!=nil{c.JSON(500,gin.H{"error":"could not prepare webhook"});return};message:="Meridian test alert: "+name+". Delivery configuration is being checked.";body,_:=json.Marshal(gin.H{"text":message,"@type":"MessageCard","@context":"https://schema.org/extensions","summary":message,"themeColor":"3B82F6","title":"Meridian test alert"});go a.deliverWebhook(context.Background(),ruleID,nil,plain,body);if emailTo!=nil&&strings.TrimSpace(*emailTo)!=""{go a.deliverAlertEmail(context.Background(),ruleID,nil,name,0,*emailTo)};c.JSON(202,gin.H{"status":"test delivery queued"}) }
+// targetWindowStats is one target's probe totals over a trailing window.
+type targetWindowStats struct {
+	ID               uuid.UUID
+	Name             string
+	Runs             int
+	Passed           int
+	Failed           int
+	UptimePercent    float64
+	AverageLatencyMS int
+}
+
+// windowStats returns per-target run counts, uptime, and average run latency
+// (sum of layer latencies) for the trailing `hours`, ordered by target name.
+func (a *App) windowStats(ctx context.Context, hours int) ([]targetWindowStats, error) {
+	rows, err := a.pg.Query(ctx, `SELECT t.id,t.name,COUNT(r.id),COUNT(r.id) FILTER (WHERE r.overall_status='pass'),COUNT(r.id) FILTER (WHERE r.overall_status='fail'),COALESCE(AVG(x.latency),0) FROM targets t LEFT JOIN probe_runs r ON r.target_id=t.id AND r.started_at >= now() - ($1 * interval '1 hour') LEFT JOIN LATERAL (SELECT SUM(latency_ms) AS latency FROM probe_results WHERE run_id=r.id) x ON true GROUP BY t.id,t.name ORDER BY t.name`, hours)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []targetWindowStats{}
+	for rows.Next() {
+		var s targetWindowStats
+		var latency float64
+		if err := rows.Scan(&s.ID, &s.Name, &s.Runs, &s.Passed, &s.Failed, &latency); err != nil {
+			return nil, err
+		}
+		if s.Runs > 0 {
+			s.UptimePercent = float64(s.Passed) * 100 / float64(s.Runs)
+		}
+		s.AverageLatencyMS = int(latency)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (a *App) analytics(c *gin.Context) {
 	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
 	if hours != 24 && hours != 168 && hours != 720 { c.JSON(400, gin.H{"error":"hours must be 24, 168, or 720"}); return }
-	rows, err := a.pg.Query(c, `SELECT t.id,t.name,COUNT(r.id),COUNT(r.id) FILTER (WHERE r.overall_status='pass'),COUNT(r.id) FILTER (WHERE r.overall_status='fail'),COALESCE(AVG(x.latency),0) FROM targets t LEFT JOIN probe_runs r ON r.target_id=t.id AND r.started_at >= now() - ($1 * interval '1 hour') LEFT JOIN LATERAL (SELECT SUM(latency_ms) AS latency FROM probe_results WHERE run_id=r.id) x ON true GROUP BY t.id,t.name ORDER BY t.name`, hours)
+	stats, err := a.windowStats(c, hours)
 	if err != nil { c.JSON(500,gin.H{"error":err.Error()});return }
-	defer rows.Close(); out:=[]gin.H{}
-	for rows.Next(){var id uuid.UUID;var name string;var total,passed,failed int;var latency float64;_ = rows.Scan(&id,&name,&total,&passed,&failed,&latency);uptime:=float64(0);if total>0{uptime=float64(passed)*100/float64(total)};out=append(out,gin.H{"target_id":id,"target_name":name,"runs":total,"passed":passed,"failed":failed,"uptime_percent":uptime,"average_latency_ms":int(latency)})};c.JSON(200,gin.H{"hours":hours,"targets":out})
+	out:=[]gin.H{}
+	for _, s := range stats { out=append(out,gin.H{"target_id":s.ID,"target_name":s.Name,"runs":s.Runs,"passed":s.Passed,"failed":s.Failed,"uptime_percent":s.UptimePercent,"average_latency_ms":s.AverageLatencyMS}) }
+	c.JSON(200,gin.H{"hours":hours,"targets":out})
+}
+
+// sloState computes the error budget for a target given its run counts in the
+// SLO window. allowed is the number of failed runs the objective tolerates;
+// remaining goes negative once the budget is spent.
+func sloState(total, passed int, target float64) (allowed, remaining float64, state string) {
+	failed := total - passed
+	allowed = float64(total) * (100 - target) / 100
+	remaining = allowed - float64(failed)
+	switch {
+	case total == 0:
+		state = "no_data"
+	case remaining < 0:
+		state = "breached"
+	case allowed > 0 && remaining/allowed < 0.2:
+		state = "at_risk"
+	default:
+		state = "on_track"
+	}
+	return allowed, remaining, state
+}
+
+const overviewBucketCount = 24
+
+type overviewBucket struct {
+	At     time.Time `json:"at"`
+	Passed int       `json:"passed"`
+	Failed int       `json:"failed"`
+}
+
+// fillBuckets expands sparse counts keyed by "hours ago" (0 = the most recent
+// hour) into exactly overviewBucketCount rolling one-hour buckets, oldest first.
+func fillBuckets(counts map[int][2]int, now time.Time) []overviewBucket {
+	out := make([]overviewBucket, overviewBucketCount)
+	for i := range out {
+		ago := overviewBucketCount - 1 - i
+		c := counts[ago]
+		out[i] = overviewBucket{At: now.Add(-time.Duration(ago+1) * time.Hour), Passed: c[0], Failed: c[1]}
+	}
+	return out
+}
+
+// overview returns a fleet-wide 24h health snapshot for the dashboard landing page.
+func (a *App) overview(c *gin.Context) {
+	const hours = overviewBucketCount
+	now := time.Now().UTC()
+	stats, err := a.windowStats(c, hours)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+
+	meta := map[uuid.UUID]Target{}
+	if rows, err := a.pg.Query(c, `SELECT id,type,base_url FROM targets`); err == nil {
+		for rows.Next() { var t Target; if rows.Scan(&t.ID, &t.Type, &t.BaseURL) == nil { meta[t.ID] = t } }
+		rows.Close()
+	}
+
+	type latest struct { status string; at time.Time }
+	latestByTarget := map[uuid.UUID]latest{}
+	if rows, err := a.pg.Query(c, `SELECT DISTINCT ON (target_id) target_id,overall_status,started_at FROM probe_runs WHERE overall_status <> 'running' ORDER BY target_id, started_at DESC`); err == nil {
+		for rows.Next() { var id uuid.UUID; var l latest; if rows.Scan(&id, &l.status, &l.at) == nil { latestByTarget[id] = l } }
+		rows.Close()
+	}
+
+	buckets := map[uuid.UUID]map[int][2]int{}
+	if rows, err := a.pg.Query(c, `SELECT target_id, LEAST(FLOOR(EXTRACT(EPOCH FROM ($1::timestamptz - started_at)) / 3600)::int, $2::int - 1), COUNT(*) FILTER (WHERE overall_status='pass'), COUNT(*) FILTER (WHERE overall_status='fail') FROM probe_runs WHERE started_at > $1::timestamptz - ($2 * interval '1 hour') AND started_at <= $1::timestamptz GROUP BY 1,2`, now, hours); err == nil {
+		for rows.Next() {
+			var id uuid.UUID; var ago, pass, fail int
+			if rows.Scan(&id, &ago, &pass, &fail) == nil {
+				if buckets[id] == nil { buckets[id] = map[int][2]int{} }
+				buckets[id][ago] = [2]int{pass, fail}
+			}
+		}
+		rows.Close()
+	}
+
+	slos := map[uuid.UUID]gin.H{}
+	if rows, err := a.pg.Query(c, `SELECT s.target_id,s.target_uptime_percent,s.window_hours,x.total,x.passed FROM slo_targets s LEFT JOIN LATERAL (SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE overall_status='pass') AS passed FROM probe_runs r WHERE r.target_id=s.target_id AND r.started_at >= now() - (s.window_hours * interval '1 hour')) x ON true`); err == nil {
+		for rows.Next() {
+			var id uuid.UUID; var target float64; var window, total, passed int
+			if rows.Scan(&id, &target, &window, &total, &passed) == nil {
+				_, _, state := sloState(total, passed, target)
+				slos[id] = gin.H{"target_uptime_percent": target, "window_hours": window, "state": state}
+			}
+		}
+		rows.Close()
+	}
+
+	var passing, failing, noData, runs, failedRuns, sloBreached, sloAtRisk int
+	var latencyWeighted float64
+	out := []gin.H{}
+	for _, s := range stats {
+		l, seen := latestByTarget[s.ID]
+		status := "unknown"
+		var lastChecked *time.Time
+		if seen { status = l.status; at := l.at; lastChecked = &at }
+		switch status { case "pass": passing++; case "fail": failing++; default: noData++ }
+		runs += s.Runs; failedRuns += s.Failed
+		latencyWeighted += float64(s.AverageLatencyMS) * float64(s.Runs)
+		var slo any
+		if v, ok := slos[s.ID]; ok {
+			slo = v
+			switch v["state"] { case "breached": sloBreached++; case "at_risk": sloAtRisk++ }
+		}
+		m := meta[s.ID]
+		out = append(out, gin.H{"id": s.ID, "name": s.Name, "type": m.Type, "base_url": m.BaseURL, "latest_status": status, "last_checked_at": lastChecked, "runs": s.Runs, "uptime_percent": s.UptimePercent, "average_latency_ms": s.AverageLatencyMS, "slo": slo, "buckets": fillBuckets(buckets[s.ID], now)})
+	}
+	uptime, avgLatency := float64(0), 0
+	if runs > 0 {
+		uptime = float64(runs-failedRuns) * 100 / float64(runs)
+		avgLatency = int(latencyWeighted / float64(runs))
+	}
+	c.JSON(200, gin.H{"generated_at": now, "window_hours": hours, "totals": gin.H{"targets": len(stats), "passing": passing, "failing": failing, "no_data": noData, "runs": runs, "failed_runs": failedRuns, "uptime_percent": uptime, "average_latency_ms": avgLatency, "slo_breached": sloBreached, "slo_at_risk": sloAtRisk}, "targets": out})
 }
 func (a *App) analyticsTrends(c *gin.Context) {
 	hours,_:=strconv.Atoi(c.DefaultQuery("hours","24"));if hours!=24&&hours!=168&&hours!=720{c.JSON(400,gin.H{"error":"hours must be 24, 168, or 720"});return};bucket:="hour";if hours>=168{bucket="day"};targetID:=c.Query("target_id");if targetID!=""{if _,err:=uuid.Parse(targetID);err!=nil{c.JSON(400,gin.H{"error":"target_id must be a UUID"});return}}
@@ -1667,7 +1815,7 @@ func (a *App) getSLO(c *gin.Context) {
 	if err != nil { c.JSON(404,gin.H{"error":"SLO not configured"}); return }
 	var total, passed int
 	_ = a.pg.QueryRow(c, `SELECT COUNT(*),COUNT(*) FILTER (WHERE overall_status='pass') FROM probe_runs WHERE target_id=$1 AND started_at >= now() - ($2 * interval '1 hour')`, id, window).Scan(&total,&passed)
-	failed:=total-passed; actual:=float64(0); if total>0 { actual=float64(passed)*100/float64(total) }; allowed:=float64(total)*(100-target)/100; remaining:=allowed-float64(failed); state:="on_track"; if total==0 { state="no_data" } else if remaining<0 { state="breached" } else if allowed>0 && remaining/allowed<0.2 { state="at_risk" }
+	failed:=total-passed; actual:=float64(0); if total>0 { actual=float64(passed)*100/float64(total) }; allowed, remaining, state := sloState(total, passed, target)
 	c.JSON(200, gin.H{"target_id":id,"target_uptime_percent":target,"window_hours":window,"actual_uptime_percent":actual,"runs":total,"failed_runs":failed,"error_budget_allowed":allowed,"error_budget_remaining":remaining,"state":state})
 }
 func (a *App) putSLO(c *gin.Context) {

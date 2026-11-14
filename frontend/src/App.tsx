@@ -1,9 +1,10 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import { LineChart, Line, BarChart, Bar, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from 'recharts'
 import './diagnostics.css'
 import './analytics.css'
 import './slo.css'
 import './schedule.css'
+import Overview from './Overview'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8080'
 type Target = { id:string; name:string; base_url:string; type:string; schedule_interval_seconds:number; created_at:string }
@@ -66,6 +67,8 @@ export default function App() {
   const verifyMFA = async (e:FormEvent) => { e.preventDefault(); setError(''); setBusy('mfa'); try { const data=await request('/auth/mfa/verify','',{method:'POST',body:JSON.stringify({challenge:mfaChallenge,code:mfaCode})}); localStorage.setItem('meridian_token',data.token); setUser(data.user); setToken(data.token); setMFAChallenge(''); setMFACode('') } catch(e) { setError((e as Error).message) } finally { setBusy('') } }
   const signOut = async () => { try { await request('/auth/logout',token,{method:'POST'}) } catch { /* Clear the local credential even when the session already expired. */ } finally { localStorage.removeItem('meridian_token'); setUser(null); setToken('') } }
   const canAdmin = user?.role==='admin', canOperate = canAdmin || user?.role==='operator'
+  const fetchJSON = useCallback((path:string) => request(path,token), [token])
+  const mergeStatuses = useCallback((statuses:Record<string,string>) => setTargetStatuses(previous => ({...previous,...statuses})), [])
   const resetAdminPanels = () => { setShowAlertRules(false); setShowAgents(false); setShowTokens(false); setShowUsers(false); setShowAudit(false) }
   const closeAdminPanel = () => {}
   const openAdminPanel = async (panel:AdminPanel) => {
@@ -152,6 +155,7 @@ export default function App() {
     <header><div className="brand"><h1>Meridian</h1><span className={`user-role ${user?.role || 'loading'}`} title={user?.email}>{user?.role || 'loading'}</span></div><div className="actions">{canAdmin&&<button className="ghost" onClick={()=>setPage('operations')}>Operations</button>}<button className="ghost" onClick={async()=>{try{setMFAEnabled((await request('/auth/mfa/status',token)).enabled);setShowMFA(true)}catch(e){setError(`Security: ${(e as Error).message}`)}}}>Security</button><button className="ghost" onClick={signOut}>Sign out</button></div></header>
     <nav className="app-nav" aria-label="Primary navigation">{(['overview','targets','workflows','analytics','incidents',...(canAdmin?['admin'] as const:[])] as const).map(item=><button key={item} className={page===item?'active':''} onClick={async()=>{setPage(item);if(item==='admin'&&!adminPanel){setAdminPanel('alerts');setShowAlertRules(true)}if(item==='workflows'){setShowWorkflows(true);setWorkflows(await request('/workflows',token))}if(item==='analytics'){setShowAnalytics(true);setBusy('analytics');try{const [data,trend,layerData]=await Promise.all([request(`/analytics?hours=${analyticsHours}`,token),request(`/analytics/trends?hours=${analyticsHours}`,token),request(`/analytics/layers?hours=${analyticsHours}`,token)]);setAnalytics(data.targets);setTrends(trend.points);setLayers(layerData.layers)}finally{setBusy('')}}}}>{item}</button>)}</nav>
     {page==='operations'&&canAdmin&&<OperationsDashboard token={token}/>} 
+    {page==='overview'&&<Overview fetchJSON={fetchJSON} incidents={incidents} onStatuses={mergeStatuses} onOpenIncidents={()=>setPage('incidents')} onOpenTarget={id=>{const target=targets.find(t=>t.id===id);setPage('targets');if(target)selectTarget(target)}}/>}
     {page==='admin'&&<section className="admin-page"><div className="admin-menu"><h2>Administration</h2><p>Manage notifications, private agents, integration tokens, team access, and audit history.</p><div className="actions"><button className={adminPanel==='alerts'?'active':''} onClick={()=>openAdminPanel('alerts')}>Alert rules</button><button className={adminPanel==='agents'?'active':''} onClick={()=>openAdminPanel('agents')}>Agents</button><button className={adminPanel==='tokens'?'active':''} onClick={()=>openAdminPanel('tokens')}>API tokens</button><button className={adminPanel==='users'?'active':''} onClick={()=>openAdminPanel('users')}>Users</button><button className={adminPanel==='audit'?'active':''} onClick={()=>openAdminPanel('audit')}>Audit history</button></div></div><div className="admin-content">{!adminPanel&&<div className="admin-empty"><h3>Select a setting</h3><p>Choose an item on the left to manage it here.</p></div>}
       {showAlertRules&&<AlertRules targets={targets} rules={alertRules} busy={busy} onClose={closeAdminPanel} onCreate={async body=>{setBusy('alert-rule');try{await request('/alert-rules',token,{method:'POST',body:JSON.stringify(body)});setNotice('Alert rule saved.');await load()}catch(e){setError(`Alert rule: ${(e as Error).message}`)}finally{setBusy('')}}} onDelete={async id=>{setBusy(`alert-rule-${id}`);try{await request(`/alert-rules/${id}`,token,{method:'DELETE'});setNotice('Alert rule deleted.');await load()}catch(e){setError(`Alert rule: ${(e as Error).message}`)}finally{setBusy('')}}}/>} 
       {showAudit&&<AuditHistory events={audit} loading={busy==='audit'} onClose={closeAdminPanel}/>}

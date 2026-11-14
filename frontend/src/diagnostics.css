@@ -101,7 +101,7 @@
 .all-targets .target>button strong{font-size:.84rem;color:var(--text)}
 .all-targets .target>button small{color:var(--text-tertiary);font-size:.72rem;font-family:var(--font-mono)}
 
-.page-overview>.incidents,.page-targets>.incidents,.page-incidents>.grid,.page-admin>.grid,.page-admin>.incidents,.page-workflows>.grid,.page-workflows>.incidents,.page-analytics>.grid,.page-analytics>.incidents,.page-operations>.grid,.page-operations>.incidents{display:none}
+.page-overview>.grid,.page-overview>.incidents,.page-targets>.incidents,.page-incidents>.grid,.page-admin>.grid,.page-admin>.incidents,.page-workflows>.grid,.page-workflows>.incidents,.page-analytics>.grid,.page-analytics>.incidents,.page-operations>.grid,.page-operations>.incidents{display:none}
 .page-workflows .modal-backdrop,.page-analytics .modal-backdrop,.page-admin .modal-backdrop{position:static;inset:auto;padding:0;display:block;background:transparent;overflow:visible}
 .page-workflows .alert-rules-page,.page-analytics .alert-rules-page,.page-admin .alert-rules-page{width:100%;margin:0}
 .admin-page{display:grid;grid-template-columns:200px minmax(0,1fr);gap:20px;padding:20px;background:var(--bg-panel);border:1px solid var(--border);border-radius:8px}

@@ -28,6 +28,48 @@ func TestOriginAllowed(t *testing.T) {
 	}
 }
 
+func TestSLOState(t *testing.T) {
+	cases := []struct {
+		name          string
+		total, passed int
+		target        float64
+		want          string
+	}{
+		{"no runs", 0, 0, 99, "no_data"},
+		{"all passing", 100, 100, 99, "on_track"},
+		{"budget mostly left", 100, 99, 95, "on_track"},
+		{"exactly 20% budget left", 100, 96, 95, "on_track"},
+		{"under 20% budget left", 100, 91, 90, "at_risk"},
+		{"budget exactly spent", 100, 95, 95, "at_risk"},
+		{"budget exceeded", 100, 94, 95, "breached"},
+	}
+	for _, tc := range cases {
+		if _, _, got := sloState(tc.total, tc.passed, tc.target); got != tc.want {
+			t.Errorf("%s: sloState(%d,%d,%v) = %q, want %q", tc.name, tc.total, tc.passed, tc.target, got, tc.want)
+		}
+	}
+}
+
+func TestFillBuckets(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 30, 0, 0, time.UTC)
+	got := fillBuckets(map[int][2]int{0: {3, 1}, 23: {0, 2}}, now)
+	if len(got) != overviewBucketCount {
+		t.Fatalf("got %d buckets, want %d", len(got), overviewBucketCount)
+	}
+	if last := got[len(got)-1]; last.Passed != 3 || last.Failed != 1 || !last.At.Equal(now.Add(-time.Hour)) {
+		t.Errorf("most recent bucket = %+v", last)
+	}
+	if first := got[0]; first.Failed != 2 || !first.At.Equal(now.Add(-24*time.Hour)) {
+		t.Errorf("oldest bucket = %+v", first)
+	}
+	if mid := got[10]; mid.Passed != 0 || mid.Failed != 0 {
+		t.Errorf("empty hour should be zero, got %+v", mid)
+	}
+	if empty := fillBuckets(nil, now); len(empty) != overviewBucketCount {
+		t.Errorf("nil counts should still yield %d buckets", overviewBucketCount)
+	}
+}
+
 func TestMatchesShape(t *testing.T) {
 	data := map[string]any{"user": map[string]any{"id":"u_1","active":true}, "count": float64(3)}
 	if !matchesShape(data, map[string]any{"user":map[string]any{"id":"string","active":"boolean"},"count":"number"}) { t.Fatal("expected matching shape") }
