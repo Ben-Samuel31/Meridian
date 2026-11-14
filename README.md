@@ -93,7 +93,7 @@ Open:
 
 | Service | Address |
 |---|---|
-| Dashboard | http://localhost:5173 |
+| Dashboard | http://meridian.localhost:5173 |
 | API | http://localhost:8080 |
 | Health check | http://localhost:8080/healthz |
 
@@ -105,6 +105,8 @@ Password: meridian-demo
 ```
 
 Change `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env` before using Meridian outside local development.
+
+`meridian.localhost` is a browser-reserved local hostname and resolves to your own machine without editing a hosts file. `http://localhost:5173` remains supported for compatibility.
 
 ### 3. Your first successful probe
 
@@ -482,6 +484,7 @@ Start from [`.env.example`](.env.example). Important settings:
 | `SESSION_HOURS` | Session lifetime; default `24` |
 | `RETENTION_DAYS` | Days to retain operational history; default `90` |
 | `DASHBOARD_URL` | Public dashboard address used in password-reset links |
+| `CORS_ORIGIN` | Comma-separated dashboard origins allowed to call the API; default `http://meridian.localhost:5173,http://localhost:5173` |
 | `SMTP_*` | Optional email-alert and password-reset delivery |
 | `OIDC_*` | Optional single sign-on configuration |
 

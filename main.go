@@ -143,7 +143,7 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 func config() Config {
-	return Config{Port: getenv("PORT", "8080"), DatabaseURL: getenv("DATABASE_URL", "postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable"), MongoURL: getenv("MONGO_URL", "mongodb://mongo:27017"), MongoDatabase: getenv("MONGO_DATABASE", "meridian"), JWTSecret: getenv("JWT_SECRET", "change-me-in-production"), WebhookSecret: getenv("WEBHOOK_SECRET", "change-me-webhook"), AdminEmail: getenv("ADMIN_EMAIL", "admin@meridian.local"), AdminPassword: getenv("ADMIN_PASSWORD", "meridian-demo"), SMTPHost: getenv("SMTP_HOST", ""), SMTPPort: getenv("SMTP_PORT", "587"), SMTPUsername: getenv("SMTP_USERNAME", ""), SMTPPassword: getenv("SMTP_PASSWORD", ""), SMTPFrom: getenv("SMTP_FROM", ""), AlertWebhookEncryptionKey: os.Getenv("ALERT_WEBHOOK_ENCRYPTION_KEY"), MFAEncryptionKey: getenv("MFA_ENCRYPTION_KEY", getenv("JWT_SECRET", "change-me-in-production")), DashboardURL: strings.TrimRight(getenv("DASHBOARD_URL", "http://localhost:5173"), "/"), OIDCAuthURL: getenv("OIDC_AUTH_URL", ""), OIDCTokenURL: getenv("OIDC_TOKEN_URL", ""), OIDCUserInfoURL: getenv("OIDC_USERINFO_URL", ""), OIDCClientID: getenv("OIDC_CLIENT_ID", ""), OIDCClientSecret: getenv("OIDC_CLIENT_SECRET", ""), OIDCRedirectURL: getenv("OIDC_REDIRECT_URL", ""), OIDCDefaultRole: getenv("OIDC_DEFAULT_ROLE", "viewer"), OIDCAutoProvision: strings.EqualFold(getenv("OIDC_AUTO_PROVISION", "false"), "true"), RetentionDays: max(1, func() int { value, err := strconv.Atoi(getenv("RETENTION_DAYS", "90")); if err != nil { return 90 }; return value }()), SessionHours: max(1, func() int { value, err := strconv.Atoi(getenv("SESSION_HOURS", "24")); if err != nil { return 24 }; return value }())}
+	return Config{Port: getenv("PORT", "8080"), DatabaseURL: getenv("DATABASE_URL", "postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable"), MongoURL: getenv("MONGO_URL", "mongodb://mongo:27017"), MongoDatabase: getenv("MONGO_DATABASE", "meridian"), JWTSecret: getenv("JWT_SECRET", "change-me-in-production"), WebhookSecret: getenv("WEBHOOK_SECRET", "change-me-webhook"), AdminEmail: getenv("ADMIN_EMAIL", "admin@meridian.local"), AdminPassword: getenv("ADMIN_PASSWORD", "meridian-demo"), SMTPHost: getenv("SMTP_HOST", ""), SMTPPort: getenv("SMTP_PORT", "587"), SMTPUsername: getenv("SMTP_USERNAME", ""), SMTPPassword: getenv("SMTP_PASSWORD", ""), SMTPFrom: getenv("SMTP_FROM", ""), AlertWebhookEncryptionKey: os.Getenv("ALERT_WEBHOOK_ENCRYPTION_KEY"), MFAEncryptionKey: getenv("MFA_ENCRYPTION_KEY", getenv("JWT_SECRET", "change-me-in-production")), DashboardURL: strings.TrimRight(getenv("DASHBOARD_URL", "http://meridian.localhost:5173"), "/"), OIDCAuthURL: getenv("OIDC_AUTH_URL", ""), OIDCTokenURL: getenv("OIDC_TOKEN_URL", ""), OIDCUserInfoURL: getenv("OIDC_USERINFO_URL", ""), OIDCClientID: getenv("OIDC_CLIENT_ID", ""), OIDCClientSecret: getenv("OIDC_CLIENT_SECRET", ""), OIDCRedirectURL: getenv("OIDC_REDIRECT_URL", ""), OIDCDefaultRole: getenv("OIDC_DEFAULT_ROLE", "viewer"), OIDCAutoProvision: strings.EqualFold(getenv("OIDC_AUTO_PROVISION", "false"), "true"), RetentionDays: max(1, func() int { value, err := strconv.Atoi(getenv("RETENTION_DAYS", "90")); if err != nil { return 90 }; return value }()), SessionHours: max(1, func() int { value, err := strconv.Atoi(getenv("SESSION_HOURS", "24")); if err != nil { return 24 }; return value }())}
 }
 
 // Alert webhook URLs often contain an unrevocable delivery token. They are
@@ -465,9 +465,31 @@ func (a *App) router() *gin.Engine {
 	api.DELETE("/alert-rules/:id", a.requireRoles("admin"), a.audit("alert_rule.deleted", "alert_rule", "Deleted an alert rule"), a.deleteAlertRule)
 	return r
 }
+// defaultCORSOrigins lists the dashboard addresses allowed to call the API when
+// CORS_ORIGIN is unset. meridian.localhost is the primary local address;
+// localhost stays allowed for compatibility.
+const defaultCORSOrigins = "http://meridian.localhost:5173,http://localhost:5173"
+
+// originAllowed reports whether origin exactly matches one entry in the
+// comma-separated allowlist. An empty origin (non-browser request) never matches.
+func originAllowed(origin, allowlist string) bool {
+	if origin == "" {
+		return false
+	}
+	for _, value := range strings.Split(allowlist, ",") {
+		if strings.TrimRight(strings.TrimSpace(value), "/") == origin {
+			return true
+		}
+	}
+	return false
+}
+
 func cors() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", getenv("CORS_ORIGIN", "http://localhost:5173"))
+		c.Header("Vary", "Origin")
+		if origin := c.GetHeader("Origin"); originAllowed(origin, getenv("CORS_ORIGIN", defaultCORSOrigins)) {
+			c.Header("Access-Control-Allow-Origin", origin)
+		}
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if c.Request.Method == http.MethodOptions {

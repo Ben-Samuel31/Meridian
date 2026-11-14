@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+func TestOriginAllowed(t *testing.T) {
+	cases := []struct {
+		origin string
+		want   bool
+	}{
+		{"http://meridian.localhost:5173", true},
+		{"http://localhost:5173", true},
+		{"http://localhost:5174", false},
+		{"http://evil.example", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := originAllowed(tc.origin, defaultCORSOrigins); got != tc.want {
+			t.Errorf("originAllowed(%q) = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+	if !originAllowed("https://meridian.example.com", " https://meridian.example.com/ , http://localhost:5173") {
+		t.Error("expected whitespace and trailing slash in allowlist entries to be ignored")
+	}
+}
+
 func TestMatchesShape(t *testing.T) {
 	data := map[string]any{"user": map[string]any{"id":"u_1","active":true}, "count": float64(3)}
 	if !matchesShape(data, map[string]any{"user":map[string]any{"id":"string","active":"boolean"},"count":"number"}) { t.Fatal("expected matching shape") }
